@@ -1,0 +1,379 @@
+#include <linux/module.h>
+#include <linux/ioctl.h>
+#include <linux/pci.h>
+#include <linux/cdev.h>
+
+#include "fdoomdev.h"
+#include "fdoomfw.h"
+#include "fharddoom.h"
+
+#define FHARDDOOM_MAX_DEVICES 256
+
+MODULE_LICENSE("GPL");
+
+struct fharddoom_device {
+	struct pci_dev *pdev;
+	struct cdev cdev;
+	int idx;
+	struct device *dev;
+	void __iomem *bar;
+	spinlock_t slock;
+/*	wait_queue_head_t queue;
+	bool messed_up;
+	bool locked_for_suspend;
+	struct file *runner;*/
+};
+
+struct fharddoom_context {
+	struct fharddoom_device *dev;
+/*	struct meme_cat cat;
+	spinlock_t slock;
+	wait_queue_head_t waiter;
+	uint64_t ready;
+	bool busy;
+	bool messed_up;*/
+};
+
+static dev_t fharddoom_devno;
+static struct fharddoom_device *fharddoom_devices[FHARDDOOM_MAX_DEVICES];
+static DEFINE_MUTEX(fharddoom_devices_lock);
+static struct class fharddoom_class = {
+	.name = "fharddoom",
+	.owner = THIS_MODULE,
+};
+
+/* Hardware handling. */
+
+static inline void fharddoom_iow(struct fharddoom_device *dev, uint32_t reg, uint32_t val)
+{
+	iowrite32(val, dev->bar + reg);
+//	printk(KERN_ALERT "adlerdev %03x <- %08x\n", reg, val);
+}
+
+static inline uint32_t fharddoom_ior(struct fharddoom_device *dev, uint32_t reg)
+{
+	uint32_t res = ioread32(dev->bar + reg);
+//	printk(KERN_ALERT "adlerdev %03x -> %08x\n", reg, res);
+	return res;
+}
+
+static irqreturn_t fharddoom_isr(int irq, void *opaque) {
+	struct fharddoom_device *dev = opaque;
+	unsigned long flags;
+	uint32_t istatus;
+	spin_lock_irqsave(&dev->slock, flags);
+	istatus = fharddoom_ior(dev, FHARDDOOM_INTR);
+	/*
+	BUG_ON(istatus & ~fharddoom_ior(dev, FHARDDOOM_INTR_ENABLE));
+	*/
+	if (istatus) {
+		/*
+		struct fharddoom_context *ctx;
+		*/
+		fharddoom_iow(dev, FHARDDOOM_INTR, istatus);
+		/*
+		BUG_ON(!dev->runner);
+		ctx = dev->runner->private_data;
+		BUG_ON(ctx->messed_up);
+		if (DEBUG & DEBUG_COMPL) printk(KERN_ALERT "job done %x\n", istatus);
+		dev->messed_up = ctx->messed_up = (istatus & FHARDDOOM_INTR_JOB_DONE) ? 0 : 1;
+		if (istatus != FHARDDOOM_INTR_JOB_DONE && DEBUG & DEBUG_COMPL) {
+			if (istatus & FHARDDOOM_INTR_PAGE_FAULT_CMD) {
+				uint32_t faulty = fharddoom_ior(dev, FHARDDOOM_TLB_CLIENT_VA(FHARDDOOM_TLB_CLIENT_CMD));
+				printk(KERN_ALERT "pdp %x\n", fharddoom_ior(dev, FHARDDOOM_TLB_USER_PDP));
+				printk(KERN_ALERT "fault cmd %x %llx\n", faulty, memecat_resolve(&ctx->cat, faulty));
+			}
+			if (istatus & FHARDDOOM_INTR_FE_ERROR) {
+				printk(KERN_ALERT "error fe %x %x %x\n", fharddoom_ior(dev, FHARDDOOM_FE_ERROR_CODE), fharddoom_ior(dev, FHARDDOOM_FE_ERROR_DATA_A), fharddoom_ior(dev, FHARDDOOM_FE_ERROR_DATA_B));
+			}
+		}
+		ctx->ready++;
+		wake_up_all(&ctx->waiter);
+		fput(dev->runner);
+		dev->runner = NULL;
+		wake_up(&dev->queue);
+		*/
+	}
+	spin_unlock_irqrestore(&dev->slock, flags);
+	return IRQ_RETVAL(istatus);
+}
+
+/* Main device node handling.  */
+
+static int fharddoom_open(struct inode *inode, struct file *file)
+{
+	struct fharddoom_device *dev = container_of(inode->i_cdev, struct fharddoom_device, cdev);
+	struct fharddoom_context *ctx = kzalloc(sizeof *ctx, GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	ctx->dev = dev;
+/*	init_waitqueue_head(&ctx->wq);
+	ctx->sum = ADLERDEV_SUM_INIT;
+	ctx->pending_buffers = 0; */
+	file->private_data = ctx;
+	return nonseekable_open(inode, file);
+}
+
+static int fharddoom_release(struct inode *inode, struct file *file)
+{
+	struct fharddoom_context *ctx = file->private_data;
+/*	struct fharddoom_device *dev = ctx->dev;
+	unsigned long flags;
+	spin_lock_irqsave(&dev->slock, flags);
+	while (ctx->pending_buffers) {
+		spin_unlock_irqrestore(&dev->slock, flags);
+		wait_event(ctx->wq, !ctx->pending_buffers);
+		spin_lock_irqsave(&dev->slock, flags);
+	}
+	spin_unlock_irqrestore(&dev->slock, flags); */
+	kfree(ctx);
+	return 0;
+}
+
+static long fharddoom_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	/*
+	struct fharddoom_context *ctx = filp->private_data;
+	struct device *dev = &ctx->dev->pdev->dev;
+	unsigned long irq;
+	void __user *p = (void*)arg;
+	*/
+	printk(KERN_ERR "fharddoom ioctl: cmd = %u\n", cmd);
+	return 0;
+}
+
+static const struct file_operations fharddoom_file_ops = {
+	.owner = THIS_MODULE,
+	.open = fharddoom_open,
+	.release = fharddoom_release,
+	.unlocked_ioctl = fharddoom_ioctl,
+	.compat_ioctl = fharddoom_ioctl,
+};
+
+static int fharddoom_probe(struct pci_dev *pdev,
+	const struct pci_device_id *pci_id)
+{
+	int err, i;
+	/* struct list_head *lh, *tmp; */
+
+	/* Allocate our structure.  */
+	struct fharddoom_device *dev = kzalloc(sizeof *dev, GFP_KERNEL);
+	if (!dev) {
+		err = -ENOMEM;
+		goto out_alloc;
+	}
+	pci_set_drvdata(pdev, dev);
+	dev->pdev = pdev;
+
+	/* Locks etc.  */
+	spin_lock_init(&dev->slock);
+	/* not sure what's this
+	init_waitqueue_head(&dev->free_wq);
+	init_waitqueue_head(&dev->idle_wq);
+	INIT_LIST_HEAD(&dev->buffers_free);
+	INIT_LIST_HEAD(&dev->buffers_running);
+	*/
+
+	/* Allocate a free index.  */
+	mutex_lock(&fharddoom_devices_lock);
+	for (i = 0; i < FHARDDOOM_MAX_DEVICES; i++)
+		if (!fharddoom_devices[i])
+			break;
+	if (i == FHARDDOOM_MAX_DEVICES) {
+		err = -ENOSPC;
+		mutex_unlock(&fharddoom_devices_lock);
+		goto out_slot;
+	}
+	fharddoom_devices[i] = dev;
+	dev->idx = i;
+	mutex_unlock(&fharddoom_devices_lock);
+
+	/* Enable hardware resources.  */
+	if ((err = pci_enable_device(pdev)))
+		goto out_enable;
+
+	if ((err = pci_set_dma_mask(pdev, DMA_BIT_MASK(40))))
+		goto out_mask;
+	if ((err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(40))))
+		goto out_mask;
+	pci_set_master(pdev);
+
+	if ((err = pci_request_regions(pdev, "fharddoom")))
+		goto out_regions;
+
+	/* Map the BAR.  */
+	if (!(dev->bar = pci_iomap(pdev, 0, 0))) {
+		err = -ENOMEM;
+		goto out_bar;
+	}
+
+	/* Connect the IRQ line.  */
+	if ((err = request_irq(pdev->irq, fharddoom_isr, IRQF_SHARED, "fharddoom", dev)))
+		goto out_irq;
+
+	/* Allocate some buffers.  */
+	/*
+	for (i = 0; i < ADLERDEV_NUM_BUFFERS; i++) {
+		struct adlerdev_buffer *buf = kmalloc(sizeof *buf, GFP_KERNEL);
+		if (!buf)
+			goto out_cdev;
+		if (!(buf->data_cpu = dma_alloc_coherent(&dev->pdev->dev,
+				PAGE_SIZE,
+				&buf->data_dma, GFP_KERNEL))) {
+			kfree(buf);
+			goto out_cdev;
+		}
+		buf->ctx = 0;
+		list_add(&buf->lh, &dev->buffers_free);
+	}
+
+	adlerdev_iow(dev, ADLERDEV_INTR, 1);
+	adlerdev_iow(dev, ADLERDEV_INTR_ENABLE, 1);
+	*/
+
+	/*
+	fharddoom_wipe(dev);
+	*/
+	
+	/* We're live.  Let's export the cdev.  */
+	cdev_init(&dev->cdev, &fharddoom_file_ops);
+	if ((err = cdev_add(&dev->cdev, fharddoom_devno + dev->idx, 1)))
+		goto out_cdev;
+
+	/* And register it in sysfs.  */
+	dev->dev = device_create(&fharddoom_class,
+			&dev->pdev->dev, fharddoom_devno + dev->idx, dev,
+			"fdoom%d", dev->idx);
+	if (IS_ERR(dev->dev)) {
+		printk(KERN_ERR "fharddoom: failed to register subdevice\n");
+		/* too bad. */
+		dev->dev = 0;
+		goto out_devdev;
+	}
+
+	return 0;
+
+out_devdev:
+	cdev_del(&dev->cdev);
+out_cdev:
+	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
+/*	list_for_each_safe(lh, tmp, &dev->buffers_free) {
+		struct adlerdev_buffer *buf = list_entry(lh, struct adlerdev_buffer, lh);
+		dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, buf->data_cpu, buf->data_dma);
+		kfree(buf);
+	}
+	*/
+	free_irq(pdev->irq, dev);
+out_irq:
+	pci_iounmap(pdev, dev->bar);
+out_bar:
+	pci_release_regions(pdev);
+out_regions:
+out_mask:
+	pci_disable_device(pdev);
+out_enable:
+	mutex_lock(&fharddoom_devices_lock);
+	fharddoom_devices[dev->idx] = 0;
+	mutex_unlock(&fharddoom_devices_lock);
+out_slot:
+	kfree(dev);
+out_alloc:
+	return err;
+}
+
+static void fharddoom_remove(struct pci_dev *pdev)
+{
+/*	struct list_head *lh, *tmp; */
+	struct fharddoom_device *dev = pci_get_drvdata(pdev);
+	if (dev->dev) {
+		device_destroy(&fharddoom_class, fharddoom_devno + dev->idx);
+	}
+	cdev_del(&dev->cdev);
+	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
+	/*
+	list_for_each_safe(lh, tmp, &dev->buffers_free) {
+		struct adlerdev_buffer *buf = list_entry(lh, struct adlerdev_buffer, lh);
+		dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, buf->data_cpu, buf->data_dma);
+		kfree(buf);
+	}
+	*/
+	free_irq(pdev->irq, dev);
+	pci_iounmap(pdev, dev->bar);
+	pci_release_regions(pdev);
+	pci_disable_device(pdev);
+	mutex_lock(&fharddoom_devices_lock);
+	fharddoom_devices[dev->idx] = 0;
+	mutex_unlock(&fharddoom_devices_lock);
+	kfree(dev);
+}
+
+static int fharddoom_suspend(struct pci_dev *pdev, pm_message_t state)
+{
+	unsigned long flags;
+	struct fharddoom_device *dev = pci_get_drvdata(pdev);
+	spin_lock_irqsave(&dev->slock, flags);
+	/*
+	while (list_empty(&dev->buffers_free)) {
+		spin_unlock_irqrestore(&dev->slock, flags);
+		wait_event(dev->idle_wq, !list_empty(&dev->buffers_free));
+		spin_lock_irqsave(&dev->slock, flags);
+	}
+	*/
+	spin_unlock_irqrestore(&dev->slock, flags);
+	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
+	return 0;
+}
+
+static int fharddoom_resume(struct pci_dev *pdev)
+{
+	struct fharddoom_device *dev = pci_get_drvdata(pdev);
+	fharddoom_iow(dev, FHARDDOOM_INTR, 1);
+	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 1);
+	return 0;
+}
+
+static struct pci_device_id fharddoom_pciids[] = {
+	{ PCI_DEVICE(FHARDDOOM_VENDOR_ID, FHARDDOOM_DEVICE_ID) },
+	{ 0 }
+};
+
+static struct pci_driver fharddoom_pci_driver = {
+	.name = "fharddoom",
+	.id_table = fharddoom_pciids,
+	.probe = fharddoom_probe,
+	.remove = fharddoom_remove,
+	.suspend = fharddoom_suspend,
+	.resume = fharddoom_resume,
+};
+
+/* Init & exit.  */
+
+static int fharddoom_init(void)
+{
+	int err;
+	if ((err = alloc_chrdev_region(&fharddoom_devno, 0, FHARDDOOM_MAX_DEVICES, "fhardoom")))
+		goto err_chrdev;
+	if ((err = class_register(&fharddoom_class)))
+		goto err_class;
+	if ((err = pci_register_driver(&fharddoom_pci_driver)))
+		goto err_pci;
+	return 0;
+
+err_pci:
+	class_unregister(&fharddoom_class);
+err_class:
+	unregister_chrdev_region(fharddoom_devno, FHARDDOOM_MAX_DEVICES);
+err_chrdev:
+	return err;
+}
+
+static void fharddoom_exit(void)
+{
+	pci_unregister_driver(&fharddoom_pci_driver);
+	class_unregister(&fharddoom_class);
+	unregister_chrdev_region(fharddoom_devno, FHARDDOOM_MAX_DEVICES);
+}
+
+module_init(fharddoom_init);
+module_exit(fharddoom_exit);
+
