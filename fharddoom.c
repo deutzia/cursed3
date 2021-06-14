@@ -2,12 +2,17 @@
 #include <linux/ioctl.h>
 #include <linux/pci.h>
 #include <linux/cdev.h>
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
 
 #include "fdoomdev.h"
 #include "fdoomfw.h"
 #include "fharddoom.h"
 
 #define FHARDDOOM_MAX_DEVICES 256
+#define FHARDDOOM_MAX_BUFFERS 64
+#define FHARDDOOM_MAX_BUFFER_SIZE (4 * 1024 * 1024)
+#define FHARDDOOM_MAX_ADDITIONAL_BUFFERS 60
 
 MODULE_LICENSE("GPL");
 
@@ -18,20 +23,47 @@ struct fharddoom_device {
 	struct device *dev;
 	void __iomem *bar;
 	spinlock_t slock;
+	uint32_t fence_last;
+/*	struct list_head buffers_free;
+	struct list_head buffers_running;
+	*/
+	wait_queue_head_t wq;
+	bool broken;
+	struct file *currently_running;
 /*	wait_queue_head_t queue;
-	bool messed_up;
 	bool locked_for_suspend;
 	struct file *runner;*/
 };
 
 struct fharddoom_context {
 	struct fharddoom_device *dev;
-/*	struct meme_cat cat;
+	bool broken;
 	spinlock_t slock;
+	int pending_buffers;
+	wait_queue_head_t wq;
+	bool ready;
+/*	struct meme_cat cat;
 	wait_queue_head_t waiter;
 	uint64_t ready;
 	bool busy;
-	bool messed_up;*/
+*/
+};
+
+struct fharddoom_buffer {
+	struct list_head lh;
+	struct fharddoom_device *dev;
+	struct fharddoom_context *ctx;
+	dma_addr_t page_table_dma;
+	uint32_t* page_table_cpu; /* just sth 4 byte */
+	size_t page_count;
+	struct list_head pages;
+	uint32_t pitch;
+};
+
+struct fharddoom_buffer_page {
+	struct list_head lh;
+	void *cpu;
+	dma_addr_t dma;
 };
 
 static dev_t fharddoom_devno;
@@ -61,41 +93,43 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque) {
 	struct fharddoom_device *dev = opaque;
 	unsigned long flags;
 	uint32_t istatus;
+	struct fharddoom_buffer *buf;
+	printk(KERN_ERR "Entering isr\n");
 	spin_lock_irqsave(&dev->slock, flags);
 	istatus = fharddoom_ior(dev, FHARDDOOM_INTR);
-	/*
-	BUG_ON(istatus & ~fharddoom_ior(dev, FHARDDOOM_INTR_ENABLE));
-	*/
 	if (istatus) {
-		/*
-		struct fharddoom_context *ctx;
-		*/
+		struct fharddoom_context* ctx;
+		printk(KERN_ERR "Handling interrupt %u\n", istatus);
 		fharddoom_iow(dev, FHARDDOOM_INTR, istatus);
-		/*
-		BUG_ON(!dev->runner);
-		ctx = dev->runner->private_data;
-		BUG_ON(ctx->messed_up);
-		if (DEBUG & DEBUG_COMPL) printk(KERN_ALERT "job done %x\n", istatus);
-		dev->messed_up = ctx->messed_up = (istatus & FHARDDOOM_INTR_JOB_DONE) ? 0 : 1;
-		if (istatus != FHARDDOOM_INTR_JOB_DONE && DEBUG & DEBUG_COMPL) {
-			if (istatus & FHARDDOOM_INTR_PAGE_FAULT_CMD) {
-				uint32_t faulty = fharddoom_ior(dev, FHARDDOOM_TLB_CLIENT_VA(FHARDDOOM_TLB_CLIENT_CMD));
-				printk(KERN_ALERT "pdp %x\n", fharddoom_ior(dev, FHARDDOOM_TLB_USER_PDP));
-				printk(KERN_ALERT "fault cmd %x %llx\n", faulty, memecat_resolve(&ctx->cat, faulty));
-			}
-			if (istatus & FHARDDOOM_INTR_FE_ERROR) {
-				printk(KERN_ALERT "error fe %x %x %x\n", fharddoom_ior(dev, FHARDDOOM_FE_ERROR_CODE), fharddoom_ior(dev, FHARDDOOM_FE_ERROR_DATA_A), fharddoom_ior(dev, FHARDDOOM_FE_ERROR_DATA_B));
-			}
+		BUG_ON(!(dev->currently_running));
+		ctx = dev->currently_running->private_data;
+		if (!(istatus & FHARDDOOM_INTR_FENCE_WAIT))
+		{
+			ctx->broken = dev->broken = 1;
 		}
-		ctx->ready++;
-		wake_up_all(&ctx->waiter);
-		fput(dev->runner);
-		dev->runner = NULL;
-		wake_up(&dev->queue);
-		*/
+		printk(KERN_ERR "waking up context\n");
+		ctx->ready = 1;
+		wake_up(&ctx->wq);
 	}
 	spin_unlock_irqrestore(&dev->slock, flags);
 	return IRQ_RETVAL(istatus);
+}
+
+static void fharddoom_wipe(struct fharddoom_device *dev) {
+	int i;
+	fharddoom_iow(dev, FHARDDOOM_ENABLE, 0);
+	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
+	fharddoom_iow(dev, FHARDDOOM_FE_CODE_ADDR, 0);
+	for (i = 0; i < (sizeof fdoomfw / sizeof fdoomfw[0]); i++)
+		fharddoom_iow(dev, FHARDDOOM_FE_CODE_WINDOW, fdoomfw[i]);
+	fharddoom_iow(dev, FHARDDOOM_RESET, 0x7f7ff3ff);
+	fharddoom_iow(dev, FHARDDOOM_INTR, 0xff0f);
+	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, FHARDDOOM_INTR_MASK);
+	fharddoom_iow(dev, FHARDDOOM_ENABLE, FHARDDOOM_ENABLE_ALL);
+	fharddoom_iow(dev, FHARDDOOM_CMD_FENCE_LAST, 0);
+	fharddoom_iow(dev, FHARDDOOM_CMD_FENCE_WAIT, 0);
+	dev->broken = 0;
+	/* FENCE if async? */
 }
 
 /* Main device node handling.  */
@@ -107,9 +141,9 @@ static int fharddoom_open(struct inode *inode, struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->dev = dev;
-/*	init_waitqueue_head(&ctx->wq);
-	ctx->sum = ADLERDEV_SUM_INIT;
-	ctx->pending_buffers = 0; */
+	init_waitqueue_head(&ctx->wq);
+	ctx->pending_buffers = 0;
+	spin_lock_init(&ctx->slock);
 	file->private_data = ctx;
 	return nonseekable_open(inode, file);
 }
@@ -117,7 +151,7 @@ static int fharddoom_open(struct inode *inode, struct file *file)
 static int fharddoom_release(struct inode *inode, struct file *file)
 {
 	struct fharddoom_context *ctx = file->private_data;
-/*	struct fharddoom_device *dev = ctx->dev;
+	struct fharddoom_device *dev = ctx->dev;
 	unsigned long flags;
 	spin_lock_irqsave(&dev->slock, flags);
 	while (ctx->pending_buffers) {
@@ -125,21 +159,335 @@ static int fharddoom_release(struct inode *inode, struct file *file)
 		wait_event(ctx->wq, !ctx->pending_buffers);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
-	spin_unlock_irqrestore(&dev->slock, flags); */
+	spin_unlock_irqrestore(&dev->slock, flags);
 	kfree(ctx);
 	return 0;
 }
 
+vm_fault_t fharddoom_page_fault(struct vm_fault *vmf) {
+	struct vm_area_struct *vma = vmf->vma;
+	struct file *file = vma->vm_file;
+	struct fharddoom_buffer *buf = file->private_data;
+	uint32_t desired_page_index = vmf->pgoff;
+	if (desired_page_index < buf->page_count) {
+		struct fharddoom_buffer_page *page;
+		uint32_t i = 0;
+		list_for_each_entry(page, &buf->pages, lh) {
+			if (desired_page_index == i) {
+				struct page *real_page = virt_to_page(page->cpu);
+				get_page(real_page);
+				vmf->page = real_page;
+				return 0;
+			}
+			i++;
+		}
+	}
+	return VM_FAULT_SIGBUS;
+}
+
+static const struct vm_operations_struct fharddoom_page_ops = {
+	.fault = fharddoom_page_fault,
+};
+
+static int fharddoom_buffer_mmap(struct file *filp, struct vm_area_struct *vma) {
+	vma->vm_ops = &fharddoom_page_ops;
+	return 0;
+}
+
+static int fharddoom_buffer_release(struct inode *inode, struct file *file) {
+	struct fharddoom_buffer_page *page, *page2;
+	struct fharddoom_buffer *buf = file->private_data;
+	struct fharddoom_device *dev = buf->dev;
+	list_for_each_entry_safe(page, page2, &buf->pages, lh) {
+		dma_free_coherent(&dev->pdev->dev, FHARDDOOM_PAGE_SIZE, page->cpu, page->dma);
+		list_del(&page->lh);
+		kfree(page);
+	}
+	dma_free_coherent(&dev->pdev->dev, FHARDDOOM_PAGE_SIZE, buf->page_table_cpu, buf->page_table_dma);
+	kfree(buf);
+	return 0;
+}
+
+static long fharddoom_buffer_ioctl(struct file* flip, unsigned int cmd, unsigned long arg)
+{
+	void __user *p = (void*)arg;
+	switch (cmd) {
+		case FDOOMDEV_IOCTL_BUFFER_RESIZE: {
+			struct fdoomdev_ioctl_buffer_resize req;
+			size_t page_count;
+			uint32_t i;
+			struct fharddoom_buffer_page *page;
+			struct fharddoom_buffer *buf = flip->private_data;
+			struct device *dev = &buf->dev->pdev->dev;
+			if (copy_from_user(&req, p, sizeof(req)))
+			{
+				return -EFAULT;
+			}
+			if (req.size > 4 * 1024 * 1024)
+			{
+				return -EINVAL;
+			}
+			page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) / FHARDDOOM_PAGE_SIZE;
+			if (page_count >= buf->page_count)
+			{
+				return 0;
+			}
+			for (i = buf->page_count; i < page_count; ++i)
+			{
+				page = kzalloc(sizeof(struct fharddoom_buffer_page), GFP_KERNEL);
+				if (!page)
+					goto err_page;
+				page->cpu = dma_alloc_coherent(dev, FHARDDOOM_PAGE_SIZE, &page->dma, GFP_KERNEL);
+				if (!page->cpu)
+				{
+					kfree(page);
+					goto err_page;
+				}
+				list_add_tail(&page->lh, &buf->pages);
+				buf->page_table_cpu[i] = FHARDDOOM_PTE_PRESENT | ((page->dma) >> FHARDDOOM_PTE_PA_SHIFT);
+			}
+			buf->page_count = page_count;
+			return 0;
+err_page:
+			/* TODO free trash mem */
+			return -ENOMEM;
+
+		}
+		default:
+			return -ENOTTY;
+	}
+}
+
+static const struct file_operations fharddoom_buffer_ops = {
+	.owner = THIS_MODULE,
+	.mmap = fharddoom_buffer_mmap,
+	.release = fharddoom_buffer_release,
+	.unlocked_ioctl = fharddoom_buffer_ioctl,
+	.compat_ioctl = fharddoom_buffer_ioctl,
+};
+
 static long fharddoom_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	/*
 	struct fharddoom_context *ctx = filp->private_data;
 	struct device *dev = &ctx->dev->pdev->dev;
 	unsigned long irq;
 	void __user *p = (void*)arg;
-	*/
 	printk(KERN_ERR "fharddoom ioctl: cmd = %u\n", cmd);
-	return 0;
+	switch (cmd) {
+		case FDOOMDEV_IOCTL_CREATE_BUFFER: {
+			struct fdoomdev_ioctl_create_buffer req;
+			struct fharddoom_buffer *buf;
+			struct fharddoom_buffer_page *page, *page2;
+			long err;
+			uint32_t i;
+			if (copy_from_user(&req, p, sizeof(req)))
+			{
+				return -EFAULT;
+			}
+			if (req.size == 0 || req.size > FHARDDOOM_MAX_BUFFER_SIZE)
+			{
+				return -EINVAL;
+			}
+			/* TODO le or leq? */
+			if ((req.pitch & 63) || req.pitch > FHARDDOOM_MAX_BUFFER_SIZE)
+			{
+				return -EINVAL;
+			}
+			err = -ENOMEM;
+			buf = kzalloc(sizeof(struct fharddoom_buffer), GFP_KERNEL);
+			if (!buf)
+			{
+				goto create_err;
+			}
+			INIT_LIST_HEAD(&buf->pages);
+			buf->dev = ctx->dev;
+			buf->page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) / FHARDDOOM_PAGE_SIZE;
+			buf->page_table_cpu = dma_alloc_coherent(dev, FHARDDOOM_PAGE_SIZE, &buf->page_table_dma, GFP_KERNEL);
+			if (!buf->page_table_cpu)
+			{
+				goto create_err_page_table;
+			}
+
+			for (i = 0; i < buf->page_count; i++)
+			{
+				page = kzalloc(sizeof(struct fharddoom_buffer_page), GFP_KERNEL);
+				if (!page)
+				{
+					goto create_err_buf;
+				}
+				page->cpu = dma_alloc_coherent(dev, FHARDDOOM_PAGE_SIZE, &page->dma, GFP_KERNEL);
+				if (!page->cpu)
+				{
+					kfree(page);
+					goto create_err_buf;
+				}
+				list_add_tail(&page->lh, &buf->pages);
+				buf->page_table_cpu[i] = FHARDDOOM_PTE_PRESENT | ((page->dma) >> FHARDDOOM_PTE_PA_SHIFT);
+			}
+			/* make sure all unused entries are zeroed */
+			for (; i < 1024; ++i)
+			{
+				buf->page_table_cpu[i] = 0;
+			}
+			buf->pitch = req.pitch;
+			
+			err = anon_inode_getfd("fharddoom buffer", &fharddoom_buffer_ops, buf, O_RDWR);
+			if (err < 0)
+			{
+				goto create_err_buf;
+			}
+			return err;
+
+create_err_buf:
+			list_for_each_entry_safe(page, page2, &buf->pages, lh)
+			{
+				dma_free_coherent(dev, FHARDDOOM_PAGE_SIZE, page->cpu, page->dma);
+				list_del(&page->lh);
+				kfree(page);
+			}
+			dma_free_coherent(dev, FHARDDOOM_PAGE_SIZE, buf->page_table_cpu, buf->page_table_dma);
+create_err_page_table:
+			kfree(buf);
+create_err:
+			return err;
+		}
+		case FDOOMDEV_IOCTL_RUN: {
+			struct fdoomdev_ioctl_run req;
+			long err;
+			uint32_t i, j;
+			struct file* main_buf_file;
+			struct file* additional_buf_files[FHARDDOOM_MAX_ADDITIONAL_BUFFERS];
+			struct fharddoom_buffer* main_buf;
+			struct fharddoom_buffer* additional_bufs[FHARDDOOM_MAX_ADDITIONAL_BUFFERS];
+			printk(KERN_ERR "handling run\n");
+			if (copy_from_user(&req, p, sizeof(req)))
+			{
+				return -EFAULT;
+			}
+			if (req.cmd_size > FHARDDOOM_MAX_BUFFER_SIZE ||
+					(req.cmd_addr & 3) ||
+					(req.cmd_size & 3) ||
+					req.buffers_num > FHARDDOOM_MAX_ADDITIONAL_BUFFERS)
+			{
+				return -EINVAL;
+			}
+			err = -EINVAL;
+			main_buf_file = fget(req.cmd_fd);
+			if (!main_buf_file)
+			{
+				return -EINVAL;
+			}
+			main_buf = main_buf_file->private_data;
+			if (main_buf_file->f_op != &fharddoom_buffer_ops
+					|| ctx->dev != main_buf->dev)
+			{
+				goto main_buf_err;
+			}
+			i = 0;
+			while (i < req.buffers_num)
+			{
+				additional_buf_files[i] = fget(req.buffer_fd[i]);
+				if (!additional_buf_files[i])
+				{
+					goto additional_buffers_err;
+				}
+				additional_bufs[i] = additional_buf_files[i]->private_data;
+				if (additional_buf_files[i]->f_op != &fharddoom_buffer_ops ||
+						additional_bufs[i]->dev != ctx->dev)
+				{
+					i++;
+					goto additional_buffers_err;
+				}
+				i++;
+			}
+			if (ctx->broken)
+			{
+				err = -EIO;
+				goto additional_buffers_err;
+			}
+			
+			/* TODO sync to make sure only one thing is running */
+
+			if (ctx->dev->broken)
+			{
+				fharddoom_wipe(ctx->dev);
+			}
+
+			ctx->dev->currently_running = get_file(filp);
+
+			ctx->ready = 0;
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				FHARDDOOM_USER_BIND_SLOT_HEADER(60, main_buf->pitch));
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				FHARDDOOM_USER_BIND_SLOT_DATA(1, 0, 1, main_buf->page_table_dma));
+			for (j = 0; j < req.buffers_num; ++j)
+			{
+				fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+					FHARDDOOM_USER_BIND_SLOT_HEADER(j,
+						additional_bufs[j]->pitch));
+				fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+					FHARDDOOM_USER_BIND_SLOT_DATA(
+						1, 1, 1, additional_bufs[j]->page_table_dma));
+			}
+			/* call */
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				FHARDDOOM_USER_CALL_HEADER(60, req.cmd_addr));
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				req.cmd_size);
+			/* clear all slots */
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				FHARDDOOM_USER_CLEAR_SLOTS_HEADER);
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				(uint32_t) -1);
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				(uint32_t) -1);
+			/* fence */
+			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+				FHARDDOOM_USER_FENCE_HEADER(0));
+
+			printk(KERN_ERR "handling run: waiting for the job to finish\n");
+			if (wait_event_interruptible(ctx->wq, ctx->ready))
+			{
+				err = -ERESTARTSYS;
+				goto additional_buffers_err;
+			}
+
+			fput(ctx->dev->currently_running);
+
+			for (i = 0; i < req.buffers_num; ++i)
+			{
+				fput(additional_buf_files[i]);
+			}
+			fput(main_buf_file);
+
+			return 0;
+additional_buffers_err:
+			for (j = 0; j < i; ++j)
+			{
+				fput(additional_buf_files[j]);
+			}
+main_buf_err:
+			fput(main_buf_file);
+			return err;
+		}
+		case FDOOMDEV_IOCTL_WAIT: {
+			struct fdoomdev_ioctl_wait req;
+			if (copy_from_user(&req, p, sizeof(req)))
+			{
+				return -EFAULT;
+			}
+			spin_lock_irqsave(&ctx->slock, irq);
+			if (ctx->broken)
+			{
+				spin_unlock_irqrestore(&ctx->slock, irq);
+				return -EIO;
+			}
+			spin_unlock_irqrestore(&ctx->slock, irq);
+			return 0;
+		}
+		default:
+			return -ENOTTY;
+	}
 }
 
 static const struct file_operations fharddoom_file_ops = {
@@ -162,14 +510,16 @@ static int fharddoom_probe(struct pci_dev *pdev,
 		err = -ENOMEM;
 		goto out_alloc;
 	}
+
+	printk(KERN_ERR "FHARDDOOM_PROBE\n");
+
 	pci_set_drvdata(pdev, dev);
 	dev->pdev = pdev;
 
 	/* Locks etc.  */
 	spin_lock_init(&dev->slock);
-	/* not sure what's this
-	init_waitqueue_head(&dev->free_wq);
-	init_waitqueue_head(&dev->idle_wq);
+	init_waitqueue_head(&dev->wq);
+	/*
 	INIT_LIST_HEAD(&dev->buffers_free);
 	INIT_LIST_HEAD(&dev->buffers_running);
 	*/
@@ -231,9 +581,7 @@ static int fharddoom_probe(struct pci_dev *pdev,
 	adlerdev_iow(dev, ADLERDEV_INTR_ENABLE, 1);
 	*/
 
-	/*
 	fharddoom_wipe(dev);
-	*/
 	
 	/* We're live.  Let's export the cdev.  */
 	cdev_init(&dev->cdev, &fharddoom_file_ops);
@@ -290,6 +638,8 @@ static void fharddoom_remove(struct pci_dev *pdev)
 	}
 	cdev_del(&dev->cdev);
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
+	fharddoom_iow(dev, FHARDDOOM_ENABLE, 0);
+	fharddoom_ior(dev, FHARDDOOM_STATUS);
 	/*
 	list_for_each_safe(lh, tmp, &dev->buffers_free) {
 		struct adlerdev_buffer *buf = list_entry(lh, struct adlerdev_buffer, lh);
