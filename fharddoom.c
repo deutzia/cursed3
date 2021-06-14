@@ -103,7 +103,7 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque) {
 		fharddoom_iow(dev, FHARDDOOM_INTR, istatus);
 		BUG_ON(!(dev->currently_running));
 		ctx = dev->currently_running->private_data;
-		if (!(istatus & FHARDDOOM_INTR_FENCE_WAIT))
+		if (istatus != FHARDDOOM_INTR_FENCE_WAIT)
 		{
 			ctx->broken = dev->broken = 1;
 		}
