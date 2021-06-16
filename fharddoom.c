@@ -139,14 +139,12 @@ static int fharddoom_release(struct inode *inode, struct file *file)
 	struct fharddoom_device *dev = ctx->dev;
 	unsigned long flags;
 	spin_lock_irqsave(&dev->slock, flags);
-	/*
-	while (ctx->running)
+	if (ctx->running)
 	{
 		spin_unlock_irqrestore(&dev->slock, flags);
-		wait_event_interruptible(ctx->wq, ctx->running);
+		wait_event_interruptible(ctx->wq, !ctx->running);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
-	*/
 	spin_unlock_irqrestore(&dev->slock, flags);
 	kfree(ctx);
 	return 0;
@@ -204,7 +202,7 @@ static long fharddoom_buffer_ioctl(struct file* flip, unsigned int cmd, unsigned
 			struct fdoomdev_ioctl_buffer_resize req;
 			size_t page_count;
 			uint32_t i;
-			struct fharddoom_buffer_page *page;
+			struct fharddoom_buffer_page *page, *page2;
 			struct fharddoom_buffer *buf = flip->private_data;
 			struct device *dev = &buf->dev->pdev->dev;
 			if (copy_from_user(&req, p, sizeof(req)))
@@ -220,6 +218,8 @@ static long fharddoom_buffer_ioctl(struct file* flip, unsigned int cmd, unsigned
 			{
 				return 0;
 			}
+			page2 = container_of(buf->pages.prev, struct fharddoom_buffer_page, lh);
+
 			for (i = buf->page_count; i < page_count; ++i)
 			{
 				page = kzalloc(sizeof(struct fharddoom_buffer_page), GFP_KERNEL);
@@ -237,7 +237,14 @@ static long fharddoom_buffer_ioctl(struct file* flip, unsigned int cmd, unsigned
 			buf->page_count = page_count;
 			return 0;
 err_page:
-			/* TODO free trash mem */
+			/* TODO test this? how even? */
+			page = page2;
+			list_for_each_entry_safe_from(page, page2, &buf->pages, lh)
+			{
+				dma_free_coherent(dev, FHARDDOOM_PAGE_SIZE, page->cpu, page->dma);
+				list_del(&page->lh);
+				kfree(page);
+			}
 			return -ENOMEM;
 
 		}
@@ -392,6 +399,7 @@ create_err:
 			if (ctx->broken)
 			{
 				err = -EIO;
+				spin_unlock_irqrestore(&ctx->slock, irq);
 				goto additional_buffers_err;
 			}
 			
@@ -408,7 +416,7 @@ create_err:
 			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 				FHARDDOOM_USER_BIND_SLOT_HEADER(60, main_buf->pitch));
 			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
-				FHARDDOOM_USER_BIND_SLOT_DATA(1, 0, 1, main_buf->page_table_dma));
+				FHARDDOOM_USER_BIND_SLOT_DATA(1, 0, 0, main_buf->page_table_dma));
 			for (j = 0; j < req.buffers_num; ++j)
 			{
 				fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
@@ -435,10 +443,11 @@ create_err:
 				FHARDDOOM_USER_FENCE_HEADER(0));
 
 			printk(KERN_ERR "handling run: waiting for the job to finish\n");
-			if (wait_event_interruptible(ctx->wq, ctx->running))
+			spin_unlock_irqrestore(&ctx->slock, irq);
+			if (wait_event_interruptible(ctx->wq, !ctx->running))
 			{
 				err = -ERESTARTSYS;
-				goto additional_buffers_err;
+				goto currently_running_err;
 			}
 
 			fput(ctx->dev->currently_running);
@@ -448,9 +457,11 @@ create_err:
 				fput(additional_buf_files[i]);
 			}
 			fput(main_buf_file);
-			spin_unlock_irqrestore(&ctx->slock, irq);
 
 			return 0;
+currently_running_err:
+			fput(ctx->dev->currently_running);
+
 additional_buffers_err:
 			for (j = 0; j < i; ++j)
 			{
