@@ -24,29 +24,17 @@ struct fharddoom_device {
 	void __iomem *bar;
 	spinlock_t slock;
 	uint32_t fence_last;
-/*	struct list_head buffers_free;
-	struct list_head buffers_running;
-	*/
 	wait_queue_head_t wq;
 	bool broken;
 	struct file *currently_running;
-/*	wait_queue_head_t queue;
-	bool locked_for_suspend;
-	struct file *runner;*/
 };
 
 struct fharddoom_context {
 	struct fharddoom_device *dev;
 	bool broken;
 	spinlock_t slock;
-	int pending_buffers;
 	wait_queue_head_t wq;
-	bool ready;
-/*	struct meme_cat cat;
-	wait_queue_head_t waiter;
-	uint64_t ready;
-	bool busy;
-*/
+	bool running;
 };
 
 struct fharddoom_buffer {
@@ -93,7 +81,6 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque) {
 	struct fharddoom_device *dev = opaque;
 	unsigned long flags;
 	uint32_t istatus;
-	struct fharddoom_buffer *buf;
 	printk(KERN_ERR "Entering isr\n");
 	spin_lock_irqsave(&dev->slock, flags);
 	istatus = fharddoom_ior(dev, FHARDDOOM_INTR);
@@ -108,7 +95,7 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque) {
 			ctx->broken = dev->broken = 1;
 		}
 		printk(KERN_ERR "waking up context\n");
-		ctx->ready = 1;
+		ctx->running = 0;
 		wake_up(&ctx->wq);
 	}
 	spin_unlock_irqrestore(&dev->slock, flags);
@@ -129,7 +116,6 @@ static void fharddoom_wipe(struct fharddoom_device *dev) {
 	fharddoom_iow(dev, FHARDDOOM_CMD_FENCE_LAST, 0);
 	fharddoom_iow(dev, FHARDDOOM_CMD_FENCE_WAIT, 0);
 	dev->broken = 0;
-	/* FENCE if async? */
 }
 
 /* Main device node handling.  */
@@ -142,7 +128,6 @@ static int fharddoom_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 	ctx->dev = dev;
 	init_waitqueue_head(&ctx->wq);
-	ctx->pending_buffers = 0;
 	spin_lock_init(&ctx->slock);
 	file->private_data = ctx;
 	return nonseekable_open(inode, file);
@@ -154,11 +139,14 @@ static int fharddoom_release(struct inode *inode, struct file *file)
 	struct fharddoom_device *dev = ctx->dev;
 	unsigned long flags;
 	spin_lock_irqsave(&dev->slock, flags);
-	while (ctx->pending_buffers) {
+	/*
+	while (ctx->running)
+	{
 		spin_unlock_irqrestore(&dev->slock, flags);
-		wait_event(ctx->wq, !ctx->pending_buffers);
+		wait_event_interruptible(ctx->wq, ctx->running);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
+	*/
 	spin_unlock_irqrestore(&dev->slock, flags);
 	kfree(ctx);
 	return 0;
@@ -228,7 +216,7 @@ static long fharddoom_buffer_ioctl(struct file* flip, unsigned int cmd, unsigned
 				return -EINVAL;
 			}
 			page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) / FHARDDOOM_PAGE_SIZE;
-			if (page_count >= buf->page_count)
+			if (page_count <= buf->page_count)
 			{
 				return 0;
 			}
@@ -400,6 +388,7 @@ create_err:
 				}
 				i++;
 			}
+			spin_lock_irqsave(&ctx->slock, irq);
 			if (ctx->broken)
 			{
 				err = -EIO;
@@ -415,7 +404,7 @@ create_err:
 
 			ctx->dev->currently_running = get_file(filp);
 
-			ctx->ready = 0;
+			ctx->running = 1;
 			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 				FHARDDOOM_USER_BIND_SLOT_HEADER(60, main_buf->pitch));
 			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
@@ -446,7 +435,7 @@ create_err:
 				FHARDDOOM_USER_FENCE_HEADER(0));
 
 			printk(KERN_ERR "handling run: waiting for the job to finish\n");
-			if (wait_event_interruptible(ctx->wq, ctx->ready))
+			if (wait_event_interruptible(ctx->wq, ctx->running))
 			{
 				err = -ERESTARTSYS;
 				goto additional_buffers_err;
@@ -459,6 +448,7 @@ create_err:
 				fput(additional_buf_files[i]);
 			}
 			fput(main_buf_file);
+			spin_unlock_irqrestore(&ctx->slock, irq);
 
 			return 0;
 additional_buffers_err:
@@ -502,7 +492,6 @@ static int fharddoom_probe(struct pci_dev *pdev,
 	const struct pci_device_id *pci_id)
 {
 	int err, i;
-	/* struct list_head *lh, *tmp; */
 
 	/* Allocate our structure.  */
 	struct fharddoom_device *dev = kzalloc(sizeof *dev, GFP_KERNEL);
@@ -519,10 +508,6 @@ static int fharddoom_probe(struct pci_dev *pdev,
 	/* Locks etc.  */
 	spin_lock_init(&dev->slock);
 	init_waitqueue_head(&dev->wq);
-	/*
-	INIT_LIST_HEAD(&dev->buffers_free);
-	INIT_LIST_HEAD(&dev->buffers_running);
-	*/
 
 	/* Allocate a free index.  */
 	mutex_lock(&fharddoom_devices_lock);
@@ -561,26 +546,6 @@ static int fharddoom_probe(struct pci_dev *pdev,
 	if ((err = request_irq(pdev->irq, fharddoom_isr, IRQF_SHARED, "fharddoom", dev)))
 		goto out_irq;
 
-	/* Allocate some buffers.  */
-	/*
-	for (i = 0; i < ADLERDEV_NUM_BUFFERS; i++) {
-		struct adlerdev_buffer *buf = kmalloc(sizeof *buf, GFP_KERNEL);
-		if (!buf)
-			goto out_cdev;
-		if (!(buf->data_cpu = dma_alloc_coherent(&dev->pdev->dev,
-				PAGE_SIZE,
-				&buf->data_dma, GFP_KERNEL))) {
-			kfree(buf);
-			goto out_cdev;
-		}
-		buf->ctx = 0;
-		list_add(&buf->lh, &dev->buffers_free);
-	}
-
-	adlerdev_iow(dev, ADLERDEV_INTR, 1);
-	adlerdev_iow(dev, ADLERDEV_INTR_ENABLE, 1);
-	*/
-
 	fharddoom_wipe(dev);
 	
 	/* We're live.  Let's export the cdev.  */
@@ -605,12 +570,6 @@ out_devdev:
 	cdev_del(&dev->cdev);
 out_cdev:
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
-/*	list_for_each_safe(lh, tmp, &dev->buffers_free) {
-		struct adlerdev_buffer *buf = list_entry(lh, struct adlerdev_buffer, lh);
-		dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, buf->data_cpu, buf->data_dma);
-		kfree(buf);
-	}
-	*/
 	free_irq(pdev->irq, dev);
 out_irq:
 	pci_iounmap(pdev, dev->bar);
@@ -631,7 +590,6 @@ out_alloc:
 
 static void fharddoom_remove(struct pci_dev *pdev)
 {
-/*	struct list_head *lh, *tmp; */
 	struct fharddoom_device *dev = pci_get_drvdata(pdev);
 	if (dev->dev) {
 		device_destroy(&fharddoom_class, fharddoom_devno + dev->idx);
@@ -640,13 +598,6 @@ static void fharddoom_remove(struct pci_dev *pdev)
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
 	fharddoom_iow(dev, FHARDDOOM_ENABLE, 0);
 	fharddoom_ior(dev, FHARDDOOM_STATUS);
-	/*
-	list_for_each_safe(lh, tmp, &dev->buffers_free) {
-		struct adlerdev_buffer *buf = list_entry(lh, struct adlerdev_buffer, lh);
-		dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, buf->data_cpu, buf->data_dma);
-		kfree(buf);
-	}
-	*/
 	free_irq(pdev->irq, dev);
 	pci_iounmap(pdev, dev->bar);
 	pci_release_regions(pdev);
@@ -662,13 +613,6 @@ static int fharddoom_suspend(struct pci_dev *pdev, pm_message_t state)
 	unsigned long flags;
 	struct fharddoom_device *dev = pci_get_drvdata(pdev);
 	spin_lock_irqsave(&dev->slock, flags);
-	/*
-	while (list_empty(&dev->buffers_free)) {
-		spin_unlock_irqrestore(&dev->slock, flags);
-		wait_event(dev->idle_wq, !list_empty(&dev->buffers_free));
-		spin_lock_irqsave(&dev->slock, flags);
-	}
-	*/
 	spin_unlock_irqrestore(&dev->slock, flags);
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
 	return 0;
