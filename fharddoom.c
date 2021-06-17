@@ -500,8 +500,9 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		wake_up(&ctx->dev->wq);
 		spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 	ctx_running_err:
-		/* TODO ctx slock */
+		spin_lock_irqsave(&ctx->slock, irq);
 		ctx->running = 0;
+		spin_unlock_irqrestore(&ctx->slock, irq);
 	additional_buffers_err:
 		for (j = 0; j < i; ++j) {
 			fput(additional_buf_files[j]);
@@ -520,8 +521,14 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			spin_unlock_irqrestore(&ctx->slock, irq);
 			return -EIO;
 		}
-		spin_unlock_irqrestore(&ctx->slock, irq);
-		/* TODO actually wait for the device */
+		if (ctx->running) {
+			spin_unlock_irqrestore(&ctx->slock, irq);
+			if (wait_event_interruptible(ctx->wq, !ctx->running)) {
+				return -ERESTARTSYS;
+			}
+		} else {
+			spin_unlock_irqrestore(&ctx->slock, irq);
+		}
 		return 0;
 	}
 	default:
