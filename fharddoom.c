@@ -137,15 +137,17 @@ static int fharddoom_release(struct inode *inode, struct file *file)
 {
 	struct fharddoom_context *ctx = file->private_data;
 	struct fharddoom_device *dev = ctx->dev;
-	unsigned long flags;
-	spin_lock_irqsave(&dev->slock, flags);
+	unsigned long flags, flags2;
+	spin_lock_irqsave(&ctx->slock, flags);
+	spin_lock_irqsave(&dev->slock, flags2);
 	if (ctx->running)
 	{
 		spin_unlock_irqrestore(&dev->slock, flags);
 		wait_event_interruptible(ctx->wq, !ctx->running);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
-	spin_unlock_irqrestore(&dev->slock, flags);
+	spin_unlock_irqrestore(&dev->slock, flags2);
+	spin_unlock_irqrestore(&ctx->slock, flags);
 	kfree(ctx);
 	return 0;
 }
@@ -265,7 +267,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd, unsigned long a
 {
 	struct fharddoom_context *ctx = filp->private_data;
 	struct device *dev = &ctx->dev->pdev->dev;
-	unsigned long irq;
+	unsigned long irq, irq2;
 	void __user *p = (void*)arg;
 	printk(KERN_ERR "fharddoom ioctl: cmd = %u\n", cmd);
 	switch (cmd) {
@@ -402,17 +404,40 @@ create_err:
 				spin_unlock_irqrestore(&ctx->slock, irq);
 				goto additional_buffers_err;
 			}
+			if (ctx->running)
+			{
+				spin_unlock_irqrestore(&ctx->slock, irq);
+				if (wait_event_interruptible(ctx->wq, !ctx->running))
+				{
+					err = -ERESTARTSYS;
+					goto additional_buffers_err;
+				}
+ 
+				spin_lock_irqsave(&ctx->slock, irq);
+			}
+			ctx->running = 1;
 			
 			/* TODO sync to make sure only one thing is running */
 
+			spin_lock_irqsave(&ctx->dev->slock, irq2);
+			if (ctx->dev->currently_running)
+			{
+				spin_unlock_irqrestore(&ctx->dev->slock, irq2);
+				spin_unlock_irqrestore(&ctx->slock, irq);
+				if (wait_event_interruptible(ctx->dev->wq, !ctx->dev->currently_running))
+				{
+					err = -ERESTARTSYS;
+					goto ctx_running_err;
+				}
+				spin_lock_irqsave(&ctx->slock, irq);
+				spin_lock_irqsave(&ctx->dev->slock, irq2);
+			}
 			if (ctx->dev->broken)
 			{
 				fharddoom_wipe(ctx->dev);
 			}
-
 			ctx->dev->currently_running = get_file(filp);
 
-			ctx->running = 1;
 			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 				FHARDDOOM_USER_BIND_SLOT_HEADER(60, main_buf->pitch));
 			fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
@@ -443,6 +468,7 @@ create_err:
 				FHARDDOOM_USER_FENCE_HEADER(0));
 
 			printk(KERN_ERR "handling run: waiting for the job to finish\n");
+			spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 			spin_unlock_irqrestore(&ctx->slock, irq);
 			if (wait_event_interruptible(ctx->wq, !ctx->running))
 			{
@@ -450,7 +476,11 @@ create_err:
 				goto currently_running_err;
 			}
 
+			spin_lock_irqsave(&ctx->dev->slock, irq2);
 			fput(ctx->dev->currently_running);
+			ctx->dev->currently_running = NULL;
+			wake_up(&ctx->dev->wq);
+			spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 
 			for (i = 0; i < req.buffers_num; ++i)
 			{
@@ -460,8 +490,13 @@ create_err:
 
 			return 0;
 currently_running_err:
+			spin_lock_irqsave(&ctx->dev->slock, irq2);
 			fput(ctx->dev->currently_running);
-
+			ctx->dev->currently_running = NULL;
+			wake_up(&ctx->dev->wq);
+			spin_unlock_irqrestore(&ctx->dev->slock, irq2);
+ctx_running_err:
+			ctx->running = 0;
 additional_buffers_err:
 			for (j = 0; j < i; ++j)
 			{
@@ -624,6 +659,7 @@ static int fharddoom_suspend(struct pci_dev *pdev, pm_message_t state)
 	unsigned long flags;
 	struct fharddoom_device *dev = pci_get_drvdata(pdev);
 	spin_lock_irqsave(&dev->slock, flags);
+	/* TODO */
 	spin_unlock_irqrestore(&dev->slock, flags);
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
 	return 0;
