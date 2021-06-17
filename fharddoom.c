@@ -102,6 +102,7 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque) {
 	return IRQ_RETVAL(istatus);
 }
 
+/* assumes spinlock is held */
 static void fharddoom_wipe(struct fharddoom_device *dev) {
 	int i;
 	fharddoom_iow(dev, FHARDDOOM_ENABLE, 0);
@@ -143,7 +144,9 @@ static int fharddoom_release(struct inode *inode, struct file *file)
 	if (ctx->running)
 	{
 		spin_unlock_irqrestore(&dev->slock, flags);
+		spin_unlock_irqrestore(&ctx->slock, flags);
 		wait_event_interruptible(ctx->wq, !ctx->running);
+		spin_lock_irqsave(&ctx->slock, flags);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
 	spin_unlock_irqrestore(&dev->slock, flags2);
@@ -416,8 +419,6 @@ create_err:
 				spin_lock_irqsave(&ctx->slock, irq);
 			}
 			ctx->running = 1;
-			
-			/* TODO sync to make sure only one thing is running */
 
 			spin_lock_irqsave(&ctx->dev->slock, irq2);
 			if (ctx->dev->currently_running)
@@ -659,17 +660,26 @@ static int fharddoom_suspend(struct pci_dev *pdev, pm_message_t state)
 	unsigned long flags;
 	struct fharddoom_device *dev = pci_get_drvdata(pdev);
 	spin_lock_irqsave(&dev->slock, flags);
-	/* TODO */
-	spin_unlock_irqrestore(&dev->slock, flags);
+	if (dev->currently_running)
+	{
+		spin_unlock_irqrestore(&dev->slock, flags);
+		wait_event(dev->wq, !dev->currently_running);
+		spin_lock_irqsave(&dev->slock, flags);
+	}
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
+	fharddoom_iow(dev, FHARDDOOM_ENABLE, 0);
+	fharddoom_ior(dev, FHARDDOOM_INTR);
+	spin_unlock_irqrestore(&dev->slock, flags);
 	return 0;
 }
 
 static int fharddoom_resume(struct pci_dev *pdev)
 {
+	unsigned long flags;
 	struct fharddoom_device *dev = pci_get_drvdata(pdev);
-	fharddoom_iow(dev, FHARDDOOM_INTR, 1);
-	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 1);
+	spin_lock_irqsave(&dev->slock, flags);
+	fharddoom_wipe(dev);
+	spin_unlock_irqrestore(&dev->slock, flags);
 	return 0;
 }
 
