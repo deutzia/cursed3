@@ -68,13 +68,11 @@ static inline void fharddoom_iow(struct fharddoom_device *dev, uint32_t reg,
 				 uint32_t val)
 {
 	iowrite32(val, dev->bar + reg);
-	//	printk(KERN_ALERT "adlerdev %03x <- %08x\n", reg, val);
 }
 
 static inline uint32_t fharddoom_ior(struct fharddoom_device *dev, uint32_t reg)
 {
 	uint32_t res = ioread32(dev->bar + reg);
-	//	printk(KERN_ALERT "adlerdev %03x -> %08x\n", reg, res);
 	return res;
 }
 
@@ -233,6 +231,7 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 		page2 = container_of(buf->pages.prev,
 				     struct fharddoom_buffer_page, lh);
 
+		/* TODO lock buffers? */
 		for (i = buf->page_count; i < page_count; ++i) {
 			page = kzalloc(sizeof(struct fharddoom_buffer_page),
 				       GFP_KERNEL);
@@ -440,6 +439,13 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		}
 		ctx->dev->currently_running = get_file(filp);
 
+		/* clear all slots */
+		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+			      FHARDDOOM_USER_CLEAR_SLOTS_HEADER);
+		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+			      (uint32_t)-1);
+		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
+			      (uint32_t)-1);
 		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 			      FHARDDOOM_USER_BIND_SLOT_HEADER(60,
 							      main_buf->pitch));
@@ -461,13 +467,6 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			      FHARDDOOM_USER_CALL_HEADER(60, req.cmd_addr));
 		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 			      req.cmd_size);
-		/* clear all slots */
-		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
-			      FHARDDOOM_USER_CLEAR_SLOTS_HEADER);
-		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
-			      (uint32_t)-1);
-		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
-			      (uint32_t)-1);
 		/* fence */
 		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 			      FHARDDOOM_USER_FENCE_HEADER(0));
@@ -480,6 +479,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			err = -ERESTARTSYS;
 			goto currently_running_err;
 		}
+		printk(KERN_ERR "handling run: after waiting\n");
 
 		spin_lock_irqsave(&ctx->dev->slock, irq2);
 		fput(ctx->dev->currently_running);
@@ -500,6 +500,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		wake_up(&ctx->dev->wq);
 		spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 	ctx_running_err:
+		/* TODO ctx slock */
 		ctx->running = 0;
 	additional_buffers_err:
 		for (j = 0; j < i; ++j) {
@@ -520,6 +521,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			return -EIO;
 		}
 		spin_unlock_irqrestore(&ctx->slock, irq);
+		/* TODO actually wait for the device */
 		return 0;
 	}
 	default:
