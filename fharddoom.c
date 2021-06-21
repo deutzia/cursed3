@@ -10,7 +10,6 @@
 #include "fharddoom.h"
 
 #define FHARDDOOM_MAX_DEVICES 256
-#define FHARDDOOM_MAX_BUFFERS 64
 #define FHARDDOOM_MAX_BUFFER_SIZE (4 * 1024 * 1024)
 #define FHARDDOOM_MAX_ADDITIONAL_BUFFERS 60
 
@@ -46,7 +45,6 @@ struct fharddoom_buffer {
 	size_t page_count;
 	struct list_head pages;
 	uint32_t pitch;
-	spinlock_t slock;
 };
 
 struct fharddoom_buffer_page {
@@ -82,19 +80,16 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque)
 	struct fharddoom_device *dev = opaque;
 	unsigned long flags;
 	uint32_t istatus;
-	printk(KERN_ERR "Entering isr\n");
 	spin_lock_irqsave(&dev->slock, flags);
 	istatus = fharddoom_ior(dev, FHARDDOOM_INTR);
 	if (istatus) {
 		struct fharddoom_context *ctx;
-		printk(KERN_ERR "Handling interrupt %u\n", istatus);
 		fharddoom_iow(dev, FHARDDOOM_INTR, istatus);
 		BUG_ON(!(dev->currently_running));
 		ctx = dev->currently_running->private_data;
 		if (istatus != FHARDDOOM_INTR_FENCE_WAIT) {
 			ctx->broken = dev->broken = 1;
 		}
-		printk(KERN_ERR "waking up context\n");
 		ctx->running = 0;
 		wake_up(&ctx->wq);
 	}
@@ -222,7 +217,7 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 		if (copy_from_user(&req, p, sizeof(req))) {
 			return -EFAULT;
 		}
-		if (req.size > 4 * 1024 * 1024) {
+		if (req.size > FHARDDOOM_MAX_BUFFER_SIZE) {
 			return -EINVAL;
 		}
 		page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) /
@@ -236,10 +231,9 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 		spin_lock_irqsave(&buf->dev->slock, irq);
 		/* need to make sure device is not using this buffer */
 		if (buf->dev->currently_used) {
-			spin_unlock_irqrestore(&buf->slock, irq);
+			spin_unlock_irqrestore(&buf->dev->slock, irq);
 			if (wait_event_interruptible(
-				    buf->dev->wq,
-				    !buf->dev->currently_used)) {
+				    buf->dev->wq, !buf->dev->currently_used)) {
 				return -ERESTARTSYS;
 			}
 			spin_lock_irqsave(&buf->dev->slock, irq);
@@ -272,7 +266,6 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 		spin_unlock_irqrestore(&buf->dev->slock, irq);
 		return 0;
 	err_page:
-		/* TODO test this? how even? */
 		page = page2;
 		list_for_each_entry_safe_from (page, page2, &buf->pages, lh) {
 			dma_free_coherent(dev, FHARDDOOM_PAGE_SIZE, page->cpu,
@@ -280,6 +273,11 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 			list_del(&page->lh);
 			kfree(page);
 		}
+
+		spin_lock_irqsave(&buf->dev->slock, irq);
+		buf->dev->currently_used = 0;
+		wake_up(&buf->dev->wq);
+		spin_unlock_irqrestore(&buf->dev->slock, irq);
 		return -ENOMEM;
 	}
 	default:
@@ -302,7 +300,6 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 	struct device *dev = &ctx->dev->pdev->dev;
 	unsigned long irq, irq2;
 	void __user *p = (void *)arg;
-	printk(KERN_ERR "fharddoom ioctl: cmd = %u\n", cmd);
 	switch (cmd) {
 	case FDOOMDEV_IOCTL_CREATE_BUFFER: {
 		struct fdoomdev_ioctl_create_buffer req;
@@ -325,7 +322,6 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			goto create_err;
 		}
 		INIT_LIST_HEAD(&buf->pages);
-		spin_lock_init(&buf->slock);
 		buf->dev = ctx->dev;
 		buf->page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) /
 				  FHARDDOOM_PAGE_SIZE;
@@ -390,7 +386,6 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		struct fharddoom_buffer *main_buf;
 		struct fharddoom_buffer
 			*additional_bufs[FHARDDOOM_MAX_ADDITIONAL_BUFFERS];
-		printk(KERN_ERR "handling run\n");
 		if (copy_from_user(&req, p, sizeof(req))) {
 			return -EFAULT;
 		}
@@ -447,8 +442,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 			spin_unlock_irqrestore(&ctx->slock, irq);
 			if (wait_event_interruptible(
-				    ctx->dev->wq,
-				    !ctx->dev->currently_used)) {
+				    ctx->dev->wq, !ctx->dev->currently_used)) {
 				err = -ERESTARTSYS;
 				goto ctx_running_err;
 			}
@@ -493,15 +487,12 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		fharddoom_iow(ctx->dev, FHARDDOOM_CMD_MANUAL_FEED,
 			      FHARDDOOM_USER_FENCE_HEADER(0));
 
-		printk(KERN_ERR
-		       "handling run: waiting for the job to finish\n");
 		spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 		spin_unlock_irqrestore(&ctx->slock, irq);
 		if (wait_event_interruptible(ctx->wq, !ctx->running)) {
 			err = -ERESTARTSYS;
 			goto currently_running_err;
 		}
-		printk(KERN_ERR "handling run: after waiting\n");
 
 		spin_lock_irqsave(&ctx->dev->slock, irq2);
 		fput(ctx->dev->currently_running);
@@ -579,8 +570,6 @@ static int fharddoom_probe(struct pci_dev *pdev,
 		err = -ENOMEM;
 		goto out_alloc;
 	}
-
-	printk(KERN_ERR "FHARDDOOM_PROBE\n");
 
 	pci_set_drvdata(pdev, dev);
 	dev->pdev = pdev;
