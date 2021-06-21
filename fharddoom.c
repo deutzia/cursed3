@@ -23,10 +23,10 @@ struct fharddoom_device {
 	struct device *dev;
 	void __iomem *bar;
 	spinlock_t slock;
-	uint32_t fence_last;
 	wait_queue_head_t wq;
 	bool broken;
 	struct file *currently_running;
+	bool currently_used;
 };
 
 struct fharddoom_context {
@@ -46,6 +46,7 @@ struct fharddoom_buffer {
 	size_t page_count;
 	struct list_head pages;
 	uint32_t pitch;
+	spinlock_t slock;
 };
 
 struct fharddoom_buffer_page {
@@ -101,7 +102,7 @@ static irqreturn_t fharddoom_isr(int irq, void *opaque)
 	return IRQ_RETVAL(istatus);
 }
 
-/* assumes spinlock is held */
+/* assumes spinlock is held or not needed */
 static void fharddoom_wipe(struct fharddoom_device *dev)
 {
 	int i;
@@ -145,7 +146,7 @@ static int fharddoom_release(struct inode *inode, struct file *file)
 	if (ctx->running) {
 		spin_unlock_irqrestore(&dev->slock, flags);
 		spin_unlock_irqrestore(&ctx->slock, flags);
-		wait_event_interruptible(ctx->wq, !ctx->running);
+		wait_event(ctx->wq, !ctx->running);
 		spin_lock_irqsave(&ctx->slock, flags);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
@@ -215,6 +216,7 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 		size_t page_count;
 		uint32_t i;
 		struct fharddoom_buffer_page *page, *page2;
+		unsigned long irq;
 		struct fharddoom_buffer *buf = flip->private_data;
 		struct device *dev = &buf->dev->pdev->dev;
 		if (copy_from_user(&req, p, sizeof(req))) {
@@ -225,13 +227,28 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 		}
 		page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) /
 			     FHARDDOOM_PAGE_SIZE;
+
 		if (page_count <= buf->page_count) {
+			/* resizing no-op can be immediate */
 			return 0;
 		}
+
+		spin_lock_irqsave(&buf->dev->slock, irq);
+		/* need to make sure device is not using this buffer */
+		if (buf->dev->currently_used) {
+			spin_unlock_irqrestore(&buf->slock, irq);
+			if (wait_event_interruptible(
+				    buf->dev->wq,
+				    !buf->dev->currently_used)) {
+				return -ERESTARTSYS;
+			}
+			spin_lock_irqsave(&buf->dev->slock, irq);
+		}
+		buf->dev->currently_used = 1;
+		spin_unlock_irqrestore(&buf->dev->slock, irq);
 		page2 = container_of(buf->pages.prev,
 				     struct fharddoom_buffer_page, lh);
 
-		/* TODO lock buffers? */
 		for (i = buf->page_count; i < page_count; ++i) {
 			page = kzalloc(sizeof(struct fharddoom_buffer_page),
 				       GFP_KERNEL);
@@ -249,6 +266,10 @@ static long fharddoom_buffer_ioctl(struct file *flip, unsigned int cmd,
 				((page->dma) >> FHARDDOOM_PTE_PA_SHIFT);
 		}
 		buf->page_count = page_count;
+		spin_lock_irqsave(&buf->dev->slock, irq);
+		buf->dev->currently_used = 0;
+		wake_up(&buf->dev->wq);
+		spin_unlock_irqrestore(&buf->dev->slock, irq);
 		return 0;
 	err_page:
 		/* TODO test this? how even? */
@@ -295,7 +316,6 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		if (req.size == 0 || req.size > FHARDDOOM_MAX_BUFFER_SIZE) {
 			return -EINVAL;
 		}
-		/* TODO le or leq? */
 		if ((req.pitch & 63) || req.pitch > FHARDDOOM_MAX_BUFFER_SIZE) {
 			return -EINVAL;
 		}
@@ -305,6 +325,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 			goto create_err;
 		}
 		INIT_LIST_HEAD(&buf->pages);
+		spin_lock_init(&buf->slock);
 		buf->dev = ctx->dev;
 		buf->page_count = (req.size + FHARDDOOM_PAGE_SIZE - 1) /
 				  FHARDDOOM_PAGE_SIZE;
@@ -422,18 +443,19 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		ctx->running = 1;
 
 		spin_lock_irqsave(&ctx->dev->slock, irq2);
-		if (ctx->dev->currently_running) {
+		if (ctx->dev->currently_used) {
 			spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 			spin_unlock_irqrestore(&ctx->slock, irq);
 			if (wait_event_interruptible(
 				    ctx->dev->wq,
-				    !ctx->dev->currently_running)) {
+				    !ctx->dev->currently_used)) {
 				err = -ERESTARTSYS;
 				goto ctx_running_err;
 			}
 			spin_lock_irqsave(&ctx->slock, irq);
 			spin_lock_irqsave(&ctx->dev->slock, irq2);
 		}
+		ctx->dev->currently_used = 1;
 		if (ctx->dev->broken) {
 			fharddoom_wipe(ctx->dev);
 		}
@@ -484,6 +506,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		spin_lock_irqsave(&ctx->dev->slock, irq2);
 		fput(ctx->dev->currently_running);
 		ctx->dev->currently_running = NULL;
+		ctx->dev->currently_used = 0;
 		wake_up(&ctx->dev->wq);
 		spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 
@@ -497,6 +520,7 @@ static long fharddoom_ioctl(struct file *filp, unsigned int cmd,
 		spin_lock_irqsave(&ctx->dev->slock, irq2);
 		fput(ctx->dev->currently_running);
 		ctx->dev->currently_running = NULL;
+		ctx->dev->currently_used = 0;
 		wake_up(&ctx->dev->wq);
 		spin_unlock_irqrestore(&ctx->dev->slock, irq2);
 	ctx_running_err:
@@ -670,9 +694,9 @@ static int fharddoom_suspend(struct pci_dev *pdev, pm_message_t state)
 	unsigned long flags;
 	struct fharddoom_device *dev = pci_get_drvdata(pdev);
 	spin_lock_irqsave(&dev->slock, flags);
-	if (dev->currently_running) {
+	if (dev->currently_used) {
 		spin_unlock_irqrestore(&dev->slock, flags);
-		wait_event(dev->wq, !dev->currently_running);
+		wait_event(dev->wq, !dev->currently_used);
 		spin_lock_irqsave(&dev->slock, flags);
 	}
 	fharddoom_iow(dev, FHARDDOOM_INTR_ENABLE, 0);
